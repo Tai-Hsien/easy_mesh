@@ -27,7 +27,6 @@ def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=
                 print('Repair completed')
             else:
                 print('Repair failed')
-                return None
         
     if need_decimate == True: 
         target_num = target_ncells
