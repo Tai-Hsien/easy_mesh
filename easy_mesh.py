@@ -9,7 +9,7 @@ import time
 # it is designed to be easy to use and easy to understand
 # current vedo version: 2023.4.6
 
-def meshsegnet_feature_process(target_mesh, need_decimate=False, target_ncells=10000):
+def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=False, target_ncells=10000):
     '''
     input: a vedo mesh object
     output: a Nx15 numpy array for the input of MeshSegNet/iMeshSegNet in either training or inference phases,
@@ -18,15 +18,16 @@ def meshsegnet_feature_process(target_mesh, need_decimate=False, target_ncells=1
     # move mesh to origin
     mesh = target_mesh.clone()
 
-    if mesh.is_manifold() == False:
-        print('trying to repair...')
-        mesh.clean()
-        mesh.non_manifold_faces(tol=0)
-        if mesh.is_manifold():
-            print('Repair completed')
-        else:
-            print('Repair failed')
-            return None
+    if check_manifold == True:
+        if mesh.is_manifold() == False:
+            print('trying to repair...')
+            mesh.clean()
+            mesh.non_manifold_faces(tol=0)
+            if mesh.is_manifold():
+                print('Repair completed')
+            else:
+                print('Repair failed')
+                return None
         
     if need_decimate == True: 
         target_num = target_ncells
@@ -135,5 +136,5 @@ if __name__ == '__main__':
     # vedo.show(teeth_mesh, expanded_teeth_mesh).close()
 
     # meshsegnet example
-    X, mesh_d = meshsegnet_feature_process(upper_mesh, need_decimate=True, target_ncells=10000)
+    X, mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, target_ncells=10000)
     print(X.shape)
