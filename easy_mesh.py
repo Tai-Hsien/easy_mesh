@@ -9,11 +9,16 @@ import time
 # it is designed to be easy to use and easy to understand
 # current vedo version: 2023.4.6
 
-def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=False, target_ncells=10000):
+def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=False, target_ncells=10000, feature_scheme='v0'):
     '''
-    input: a vedo mesh object
-    output: a Nx15 numpy array for the input of MeshSegNet/iMeshSegNet in either training or inference phases,
-            where 15 features are 9 points of a triangle, 3 barycenters, 3 normals
+    input:
+        target_mesh: a vedo mesh object
+        check_manifold: boolean; whether to check if the mesh is manifold
+        need_decimate: boolean; whether to decimate the mesh to target_ncells
+        target_ncells: int; target number of cells after decimation
+        feature_scheme: string; 'v0': MeshSegNet/iMeshSegNet, where 15 features are 9 points of a triangle, 3 barycenters, 3 normals
+                                'v1': 9 points of a triangle, 3 normals
+    output: a numpy array for the input of MeshSegNet/iMeshSegNet in either training or inference phases based on the feature_scheme
     '''
     # move mesh to origin
     mesh = target_mesh.clone()
@@ -59,9 +64,91 @@ def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=
         barycenters[:, i] = (barycenters[:, i] - mins[i]) / (maxs[i]-mins[i])
         normals[:, i] = (normals[:, i] - nmeans[i]) / nstds[i]
 
-    return np.column_stack((cells, barycenters, normals)), mesh
+    if feature_scheme == 'v0':
+        return np.column_stack((cells, barycenters, normals)), mesh
+    elif feature_scheme == 'v1':
+        return np.column_stack((cells, normals)), mesh
+    
 
+def mesh_grah_cut_optimization(target_mesh, label_probability, lambda_c=30, label_name='Label'):
+    '''
+    required packages: pygco; this function has been optimized by vecteroization
+    inputs:
+        target_mesh: a vedo mesh object
+        label_probability: a numpy array of shape (num_cells, num_classes)
+        num_classes: int; number of classes
+        lambda_c: float; parameter for the edge weight
+        label_name: string; name of the label array in the target_mesh
+    '''
+    from pygco import cut_from_graph
 
+    start_time = time.time()
+
+    num_classes = label_probability.shape[1]
+
+    round_factor = 100
+    label_probability[label_probability < 1.0e-6] = 1.0e-6
+
+    # unaries
+    unaries = -round_factor * np.log10(label_probability)
+    unaries = unaries.astype(np.int32)
+    unaries = unaries.reshape(-1, num_classes)
+
+    # parawise
+    pairwise = 1 - np.eye(num_classes, dtype=np.int32)
+
+    #edges
+    try:
+        normals = target_mesh.celldata['Normals']
+    except:
+        target_mesh.compute_normals()
+        normals = target_mesh.celldata['Normals']
+        
+    barycenters = target_mesh.cell_centers()
+
+    # find all edges [vedo build-in function is wrong]
+    all_cells = np.array(target_mesh.cells())
+    edge1 = np.sort(all_cells[:, [0, 1]])
+    edge2 = np.sort(all_cells[:, [0, 2]])
+    edge3 = np.sort(all_cells[:, [1, 2]])
+    all_unique_edges = np.unique(np.concatenate((edge1, edge2, edge3), axis=0), axis=0)
+
+    # find shared edges
+    shared_edges = []
+    for i_edge in all_unique_edges:
+        p1_id = i_edge[0]
+        p2_id = i_edge[1]
+        p1_connected_cells_ids = target_mesh.connected_cells(p1_id, return_ids=True)
+        p2_connected_cells_ids = target_mesh.connected_cells(p2_id, return_ids=True)
+        connected_cells_ids = np.intersect1d(p1_connected_cells_ids, p2_connected_cells_ids)
+        if len(connected_cells_ids) == 2:
+            shared_edges.append(connected_cells_ids)
+    shared_edges = np.array(shared_edges) # share_edge: [cell1_id, cell2_id]
+
+    cos_theta = np.dot(normals[shared_edges[:, 0], 0:3], normals[shared_edges[:, 1], 0:3].transpose()).diagonal()/np.linalg.norm(normals[shared_edges[:, 0], 0:3], axis=1)/np.linalg.norm(normals[shared_edges[:, 1], 0:3], axis=1)
+    cos_theta[cos_theta >= 1.0] = 0.9999
+    theta = np.arccos(cos_theta)
+    phi = np.linalg.norm(barycenters[shared_edges[:, 0], :] - barycenters[shared_edges[:, 1], :], axis=1)
+    
+    beta = 1 + np.linalg.norm((np.dot(normals[shared_edges[:, 0], 0:3], normals[shared_edges[:, 1], 0:3].transpose()).diagonal()).reshape(-1, 1), axis=1)
+    edges = -beta*np.log10(theta/np.pi)*phi
+    edges2 = -np.log10(theta/np.pi)*phi
+    theta_mask = theta > np.pi/2.0
+    edges[theta_mask] = edges2[theta_mask]
+    edges = np.concatenate([shared_edges, edges.reshape(-1, 1)], axis=1)
+    edges[:, 2] *= lambda_c*round_factor
+    edges = edges.astype(np.int32)
+
+    refine_labels = cut_from_graph(edges, unaries, pairwise)
+    refine_labels = refine_labels.reshape([-1, 1])
+
+    new_mesh = target_mesh.clone()
+    new_mesh.celldata['Label'] = refine_labels
+    end_time = time.time()
+    total_time = end_time - start_time
+    print("---Label has been refined: {} seconds ---".format(total_time))
+
+    return new_mesh
 
 
 def expand_selection(main_mesh, partial_mesh, n_loop=1):
@@ -128,12 +215,24 @@ def expand_selection(main_mesh, partial_mesh, n_loop=1):
 if __name__ == '__main__':
 
     upper_mesh = vedo.load('Example_01.vtp')
+    upper_mesh_d = vedo.load('Example_02_d.vtp')
+
+    # meshsegnet example
+    # X, mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, target_ncells=10000)
+    # print(X.shape)
+
+    # graph-cut example
+    label_probability = np.zeros([upper_mesh_d.ncells, 17])
+    # init probability; 0.9 for each cell with the current label
+    for i_label in range(17):
+        label_probability[upper_mesh_d.celldata['Label']==i_label, i_label] = 0.9
+    refined_label_mesh = mesh_grah_cut_optimization(upper_mesh_d, label_probability, lambda_c = 30, label_name='Label')
+    upper_mesh_d.show().close()
+    refined_label_mesh.show().close()
     
     # expand_selection example
     # teeth_mesh = upper_mesh.clone().threshold('Label', above=0.5, below=16.5, on='cells').c('red')
     # expanded_teeth_mesh = expand_selection(upper_mesh, teeth_mesh, n_loop=5).c('blue').alpha(0.5)
     # vedo.show(teeth_mesh, expanded_teeth_mesh).close()
 
-    # meshsegnet example
-    X, mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, target_ncells=10000)
-    print(X.shape)
+    
