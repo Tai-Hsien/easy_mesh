@@ -9,16 +9,16 @@ import time
 # it is designed to be easy to use and easy to understand
 # current vedo version: 2023.4.6
 
-def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=False, target_ncells=10000, feature_scheme='v0'):
+def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=False, target_ncells=10000, feature_options=['cells', 'barycenters', 'cell_normals']):
     '''
     input:
         target_mesh: a vedo mesh object
         check_manifold: boolean; whether to check if the mesh is manifold
         need_decimate: boolean; whether to decimate the mesh to target_ncells
         target_ncells: int; target number of cells after decimation
-        feature_scheme: string; 'v0': MeshSegNet/iMeshSegNet, where 15 features are 9 points of a triangle, 3 barycenters, 3 normals
-                                'v1': 9 points of a triangle, 3 normals
-    output: a numpy array for the input of MeshSegNet/iMeshSegNet in either training or inference phases based on the feature_scheme
+        feature_options: ['cells', 'barycenters', 'cell_normals'] for MeshSegNet; 'cells' musts be the first option
+                         current options: 'cells' (Nx9), 'barycenters' (Nx3), 'cell_normals' (Nx3), 'cell_curvatures' (Nx1), 'cell_densities (Nx3)'
+    output: a numpy array for the input features of segmentation model (e.g., MeshSegNet) in either training or inference phases based on the feature_scheme
     '''
     # move mesh to origin
     mesh = target_mesh.clone()
@@ -38,36 +38,84 @@ def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=
         ratio = target_num/mesh.ncells # calculate ratio
         mesh = mesh.decimate(fraction=ratio)
 
-    points = mesh.points()
+    # move mesh into origin
     mean_cell_centers = mesh.center_of_mass()
-    points[:, 0:3] -= mean_cell_centers[0:3]
+    mesh.points(mesh.points() - mean_cell_centers[0:3])
+    points = mesh.points()
 
     ids = vedo.vtk2numpy(mesh.polydata().GetPolys().GetData()).reshape((mesh.ncells, -1))[:, 1:]
     cells = points[ids].reshape(mesh.ncells, 9).astype(dtype='float32')
-    mesh.compute_normals()
-    normals = mesh.celldata['Normals']
-    barycenters = mesh.cell_centers()
-    barycenters -= mean_cell_centers[0:3]
+    cells[:, 0:3] -= points.mean(axis=0) # point 1
+    cells[:, 0:3] /= points.std(axis=0)
+    cells[:, 3:6] -= points.mean(axis=0) # point 2
+    cells[:, 3:6] /= points.std(axis=0)
+    cells[:, 6:9] -= points.mean(axis=0) # point 3
+    cells[:, 6:9] /= points.std(axis=0)
 
-    #normalized data
-    maxs = points.max(axis=0)
-    mins = points.min(axis=0)
-    means = points.mean(axis=0)
-    stds = points.std(axis=0)
-    nmeans = normals.mean(axis=0)
-    nstds = normals.std(axis=0)
+    if 'cell_normals' in feature_options:
+        mesh.compute_normals()
+        cell_normals = mesh.celldata['Normals']
+        cell_normals -= cell_normals.mean(axis=0)
+        cell_normals /= cell_normals.std(axis=0)
 
-    for i in range(3): # x, y, z direction
-        cells[:, i] = (cells[:, i] - means[i]) / stds[i] #point 1
-        cells[:, i+3] = (cells[:, i+3] - means[i]) / stds[i] #point 2
-        cells[:, i+6] = (cells[:, i+6] - means[i]) / stds[i] #point 3
-        barycenters[:, i] = (barycenters[:, i] - mins[i]) / (maxs[i]-mins[i])
-        normals[:, i] = (normals[:, i] - nmeans[i]) / nstds[i]
+    if 'barycenters' in feature_options:
+        barycenters = mesh.cell_centers()
+        # make barycenters within [0, 1]
+        barycenters[:, 0:3] -= barycenters[:, 0:3].min(axis=0)
+        barycenters[:, 0:3] /= (barycenters[:, 0:3].max(axis=0) - barycenters[:, 0:3].min(axis=0))
 
-    if feature_scheme == 'v0':
-        return np.column_stack((cells, barycenters, normals)), mesh
-    elif feature_scheme == 'v1':
-        return np.column_stack((cells, normals)), mesh
+    if 'cell_curvatures' in feature_options:
+        # mesh.compute_curvature(method=0)
+        # mesh.map_points_to_cells(arrays=(['Gauss_Curvature']), move=True)
+        # cell_curvatures = mesh.celldata['Gauss_Curvature']
+        mesh.compute_curvature(method=1)
+        mesh.map_points_to_cells(arrays=(['Mean_Curvature']), move=True)
+        cell_curvatures = mesh.celldata['Mean_Curvature']
+        cell_curvatures -= cell_curvatures.mean(axis=0)
+        cell_curvatures /= cell_curvatures.std(axis=0)
+
+    if 'cell_densities' in feature_options:
+        # features used in https://ieeexplore.ieee.org/abstract/document/10063862
+        barycenters = mesh.cell_centers()
+        
+        # make barycenters within [0, 1]
+        barycenters[:, 0:3] -= barycenters[:, 0:3].min(axis=0)
+        barycenters[:, 0:3] /= (barycenters[:, 0:3].max(axis=0) - barycenters[:, 0:3].min(axis=0))
+
+        from scipy.spatial import distance_matrix
+        M1 = np.zeros([mesh.ncells, mesh.ncells], dtype=np.float32)
+        M2 = np.zeros([mesh.ncells, mesh.ncells], dtype=np.float32)
+        M3 = np.zeros([mesh.ncells, mesh.ncells], dtype=np.float32)
+        D = distance_matrix(barycenters, barycenters) # distance matrix
+        M1[D<0.05] = 1
+        M2[D<0.1] = 1
+        M3[D<0.2] = 1
+        m1 = np.sum(M1, axis=1)
+        m2 = np.sum(M2, axis=1)
+        m3 = np.sum(M3, axis=1)
+        cell_densities = np.concatenate([m1.reshape(-1, 1), m2.reshape(-1, 1), m3.reshape(-1, 1)], axis=1)
+        cell_densities -= cell_densities.min(axis=0)
+        cell_densities /= (cell_densities.max(axis=0) - cell_densities.min(axis=0))
+
+    # 'cells' is the mandatory feature
+    X = cells
+    for i_feature in feature_options:
+        if i_feature == 'cells':
+            continue
+        elif i_feature == 'barycenters':
+            X = np.column_stack((X, barycenters))
+            mesh.celldata['Normalized_Barycenters'] = barycenters
+        elif i_feature == 'cell_normals':
+            X = np.column_stack((X, cell_normals))
+            mesh.celldata['Normalized_Normals'] = cell_normals
+        elif i_feature == 'cell_curvatures':
+            X = np.column_stack((X, cell_curvatures))
+            mesh.celldata['Normalized_Curvatures'] = cell_curvatures
+        elif i_feature == 'cell_densities':
+            X = np.column_stack((X, cell_densities))
+            mesh.celldata['Normalized_Densities'] = cell_densities
+
+    return X, mesh
     
 
 def mesh_grah_cut_optimization(target_mesh, label_probability, lambda_c=30, label_name='Label'):
@@ -217,23 +265,56 @@ if __name__ == '__main__':
 
     upper_mesh = vedo.load('Example_01.vtp')
     upper_mesh_d = vedo.load('Example_02_d.vtp')
+    # upper_mesh = vedo.load('Example_03.vtp')
 
     # meshsegnet example
-    # X, mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, target_ncells=10000)
+    X, mesh_d = meshsegnet_feature_process(upper_mesh_d, check_manifold=True, need_decimate=True, target_ncells=10000, feature_options=['cells', 'cell_curvatures', 'cell_normals', 'cell_densities', 'barycenters'])
+    print(X.shape)
+    mesh_d.write(('tmp_Example_01_d.vtp'))
+    # X, mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, target_ncells=10000, feature_options=['cells', 'cell_normals'])
+    # print(X.shape)
+    # X, mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, target_ncells=10000, feature_options=['cells'])
     # print(X.shape)
 
     # graph-cut example
-    label_probability = np.zeros([upper_mesh_d.ncells, 17])
-    # init probability; 0.9 for each cell with the current label
-    for i_label in range(17):
-        label_probability[upper_mesh_d.celldata['Label']==i_label, i_label] = 0.9
-    refined_label_mesh = mesh_grah_cut_optimization(upper_mesh_d, label_probability, lambda_c = 30, label_name='Label')
-    upper_mesh_d.show().close()
-    refined_label_mesh.show().close()
+    # label_probability = np.zeros([upper_mesh_d.ncells, 17])
+    # # init probability; 0.9 for each cell with the current label
+    # for i_label in range(17):
+    #     label_probability[upper_mesh_d.celldata['Label']==i_label, i_label] = 0.9
+    # refined_label_mesh = mesh_grah_cut_optimization(upper_mesh_d, label_probability, lambda_c = 30, label_name='Label')
+    # upper_mesh_d.show().close()
+    # refined_label_mesh.show().close()
     
     # expand_selection example
     # teeth_mesh = upper_mesh.clone().threshold('Label', above=0.5, below=16.5, on='cells').c('red')
     # expanded_teeth_mesh = expand_selection(upper_mesh, teeth_mesh, n_loop=5).c('blue').alpha(0.5)
     # vedo.show(teeth_mesh, expanded_teeth_mesh).close()
+
+    # density feature
+    # cell_centers = mesh_d.cell_centers()
+    # cell_centers[:, 0:3] -= cell_centers[:, 0:3].min(axis=0)
+    # cell_centers[:, 0:3] /= (cell_centers[:, 0:3].max(axis=0) - cell_centers[:, 0:3].min(axis=0))
+    # from scipy.spatial import distance_matrix
+    # M1 = np.zeros([mesh_d.ncells, mesh_d.ncells])
+    # M2 = np.zeros([mesh_d.ncells, mesh_d.ncells])
+    # M3 = np.zeros([mesh_d.ncells, mesh_d.ncells])
+    # D = distance_matrix(cell_centers, cell_centers)
+    # # print(D)
+    # M1[D<0.05] = 1
+    # M2[D<0.1] = 1
+    # M3[D<0.2] = 1
+    # m1 = np.sum(M1, axis=1)
+    # m2 = np.sum(M2, axis=1)
+    # m3 = np.sum(M3, axis=1)
+    # m = np.concatenate([m1.reshape(-1, 1), m2.reshape(-1, 1), m3.reshape(-1, 1)], axis=1)
+    # print(m)
+    # m -= m.min(axis=0)
+    # m /= (m.max(axis=0) - m.min(axis=0))
+    # print(m)
+    # print(m.shape)
+    # mesh_d.celldata['Density'] = m
+    # mesh_d.celldata['Density_mag'] = np.linalg.norm(m, axis=1)
+    # mesh_d.write(('tmp_Example_03_d.vtp'))
+
 
     
