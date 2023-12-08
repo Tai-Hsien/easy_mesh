@@ -84,6 +84,7 @@ def mesh_grah_cut_optimization(target_mesh, label_probability, lambda_c=30, labe
 
     start_time = time.time()
 
+    label_probability = label_probability.squeeze()
     num_classes = label_probability.shape[1]
 
     round_factor = 100
