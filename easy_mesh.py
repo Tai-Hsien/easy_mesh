@@ -16,8 +16,8 @@ def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=
         check_manifold: boolean; whether to check if the mesh is manifold
         need_decimate: boolean; whether to decimate the mesh to target_ncells
         target_ncells: int; target number of cells after decimation
-        feature_options: ['cells', 'barycenters', 'cell_normals'] for MeshSegNet; 'cells' musts be the first option
-                         current options: 'cells' (Nx9), 'barycenters' (Nx3), 'cell_normals' (Nx3), 'cell_curvatures' (Nx1), 'cell_densities (Nx3)'
+        feature_options: ['cells', 'barycenters', 'cell_normals'] for MeshSegNet; either 'points' or 'cells' musts be the first option
+                         current options: 'points' (NPx3), 'cells' (NCx9), 'barycenters' (NCx3), 'cell_normals' (NCx3), 'cell_curvatures' (NCx1), 'cell_densities (NCx3)'
     output: a numpy array for the input features of segmentation model (e.g., MeshSegNet) in either training or inference phases based on the feature_scheme
     '''
     # move mesh to origin
@@ -38,82 +38,139 @@ def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=
         ratio = target_num/mesh.ncells # calculate ratio
         mesh = mesh.decimate(fraction=ratio)
 
-    # move mesh into origin
+    # move points into origin
+    # mesh.points(mesh.points() - mean_cell_centers[0:3])
     mean_cell_centers = mesh.center_of_mass()
-    mesh.points(mesh.points() - mean_cell_centers[0:3])
-    points = mesh.points()
+    points = mesh.points() - mean_cell_centers[0:3]
 
-    ids = vedo.vtk2numpy(mesh.polydata().GetPolys().GetData()).reshape((mesh.ncells, -1))[:, 1:]
-    cells = points[ids].reshape(mesh.ncells, 9).astype(dtype='float32')
-    cells[:, 0:3] -= points.mean(axis=0) # point 1
-    cells[:, 0:3] /= points.std(axis=0)
-    cells[:, 3:6] -= points.mean(axis=0) # point 2
-    cells[:, 3:6] /= points.std(axis=0)
-    cells[:, 6:9] -= points.mean(axis=0) # point 3
-    cells[:, 6:9] /= points.std(axis=0)
+    if 'points' in feature_options:
+        points -= points.mean(axis=0)
+        points /= points.std(axis=0)
 
-    if 'cell_normals' in feature_options:
-        mesh.compute_normals()
-        cell_normals = mesh.celldata['Normals']
-        cell_normals -= cell_normals.mean(axis=0)
-        cell_normals /= cell_normals.std(axis=0)
-
-    if 'barycenters' in feature_options:
-        barycenters = mesh.cell_centers()
-        # make barycenters within [0, 1]
-        barycenters[:, 0:3] -= barycenters[:, 0:3].min(axis=0)
-        barycenters[:, 0:3] /= (barycenters[:, 0:3].max(axis=0) - barycenters[:, 0:3].min(axis=0))
-
-    if 'cell_curvatures' in feature_options:
-        # mesh.compute_curvature(method=0)
-        # mesh.map_points_to_cells(arrays=(['Gauss_Curvature']), move=True)
-        # cell_curvatures = mesh.celldata['Gauss_Curvature']
-        mesh.compute_curvature(method=1)
-        mesh.map_points_to_cells(arrays=(['Mean_Curvature']), move=True)
-        cell_curvatures = mesh.celldata['Mean_Curvature']
-        cell_curvatures -= cell_curvatures.mean(axis=0)
-        cell_curvatures /= cell_curvatures.std(axis=0)
-
-    if 'cell_densities' in feature_options:
-        # features used in https://ieeexplore.ieee.org/abstract/document/10063862
-        barycenters = mesh.cell_centers()
+        if 'point_normals' in feature_options:
+            mesh.compute_normals(points=True, cells=False)
+            point_normals = mesh.pointdata['Normals']
+            point_normals -= point_normals.mean(axis=0)
+            point_normals /= point_normals.std(axis=0)
         
-        # make barycenters within [0, 1]
-        barycenters[:, 0:3] -= barycenters[:, 0:3].min(axis=0)
-        barycenters[:, 0:3] /= (barycenters[:, 0:3].max(axis=0) - barycenters[:, 0:3].min(axis=0))
+        if 'point_curvatures' in feature_options:
+            mesh.compute_curvature(method=1)
+            point_curvatures = mesh.pointdata['Mean_Curvature']
+            point_curvatures -= point_curvatures.mean(axis=0)
+            point_curvatures /= point_curvatures.std(axis=0)
 
-        from scipy.spatial import distance_matrix
-        M1 = np.zeros([mesh.ncells, mesh.ncells], dtype=np.float32)
-        M2 = np.zeros([mesh.ncells, mesh.ncells], dtype=np.float32)
-        M3 = np.zeros([mesh.ncells, mesh.ncells], dtype=np.float32)
-        D = distance_matrix(barycenters, barycenters) # distance matrix
-        M1[D<0.05] = 1
-        M2[D<0.1] = 1
-        M3[D<0.2] = 1
-        m1 = np.sum(M1, axis=1)
-        m2 = np.sum(M2, axis=1)
-        m3 = np.sum(M3, axis=1)
-        cell_densities = np.concatenate([m1.reshape(-1, 1), m2.reshape(-1, 1), m3.reshape(-1, 1)], axis=1)
-        cell_densities -= cell_densities.min(axis=0)
-        cell_densities /= (cell_densities.max(axis=0) - cell_densities.min(axis=0))
+        if 'point_densities' in feature_options:
+            # features used in https://ieeexplore.ieee.org/abstract/document/10063862
+            barycenters = mesh.cell_centers()
+            
+            # make barycenters within [0, 1]
+            unity_points = points.copy()
+            unity_points -= unity_points.min(axis=0)
+            unity_points /= (unity_points.max(axis=0) - unity_points.min(axis=0))
 
-    # 'cells' is the mandatory feature
-    X = cells
-    for i_feature in feature_options:
-        if i_feature == 'cells':
-            continue
-        elif i_feature == 'barycenters':
-            X = np.column_stack((X, barycenters))
-            mesh.celldata['Normalized_Barycenters'] = barycenters
-        elif i_feature == 'cell_normals':
-            X = np.column_stack((X, cell_normals))
-            mesh.celldata['Normalized_Normals'] = cell_normals
-        elif i_feature == 'cell_curvatures':
-            X = np.column_stack((X, cell_curvatures))
-            mesh.celldata['Normalized_Curvatures'] = cell_curvatures
-        elif i_feature == 'cell_densities':
-            X = np.column_stack((X, cell_densities))
-            mesh.celldata['Normalized_Densities'] = cell_densities
+            from scipy.spatial import distance_matrix
+            PM1 = np.zeros([mesh.npoints, mesh.npoints], dtype=np.float32)
+            PM2 = np.zeros([mesh.npoints, mesh.npoints], dtype=np.float32)
+            PM3 = np.zeros([mesh.npoints, mesh.npoints], dtype=np.float32)
+            D = distance_matrix(unity_points, unity_points) # distance matrix
+            PM1[D<0.05] = 1
+            PM2[D<0.1] = 1
+            PM3[D<0.2] = 1
+            pm1 = np.sum(PM1, axis=1)
+            pm2 = np.sum(PM2, axis=1)
+            pm3 = np.sum(PM3, axis=1)
+            point_densities = np.concatenate([pm1.reshape(-1, 1), pm2.reshape(-1, 1), pm3.reshape(-1, 1)], axis=1)
+            point_densities -= point_densities.min(axis=0)
+            point_densities /= (point_densities.max(axis=0) - point_densities.min(axis=0))
+
+    if 'cells' in feature_options:
+        ids = vedo.vtk2numpy(mesh.polydata().GetPolys().GetData()).reshape((mesh.ncells, -1))[:, 1:]
+        cells = points[ids].reshape(mesh.ncells, 9).astype(dtype='float32')
+        cells[:, 0:3] -= points.mean(axis=0) # point 1
+        cells[:, 0:3] /= points.std(axis=0)
+        cells[:, 3:6] -= points.mean(axis=0) # point 2
+        cells[:, 3:6] /= points.std(axis=0)
+        cells[:, 6:9] -= points.mean(axis=0) # point 3
+        cells[:, 6:9] /= points.std(axis=0)
+
+        if 'cell_normals' in feature_options:
+            mesh.compute_normals(points=False, cells=True)
+            cell_normals = mesh.celldata['Normals']
+            cell_normals -= cell_normals.mean(axis=0)
+            cell_normals /= cell_normals.std(axis=0)
+
+        if 'barycenters' in feature_options:
+            barycenters = mesh.cell_centers()
+            # make barycenters within [0, 1]
+            barycenters[:, 0:3] -= barycenters[:, 0:3].min(axis=0)
+            barycenters[:, 0:3] /= (barycenters[:, 0:3].max(axis=0) - barycenters[:, 0:3].min(axis=0))
+
+        if 'cell_curvatures' in feature_options:
+            # mesh.compute_curvature(method=0)
+            # mesh.map_points_to_cells(arrays=(['Gauss_Curvature']), move=True)
+            # cell_curvatures = mesh.celldata['Gauss_Curvature']
+            mesh.compute_curvature(method=1)
+            mesh.map_points_to_cells(arrays=(['Mean_Curvature']), move=True)
+            cell_curvatures = mesh.celldata['Mean_Curvature']
+            cell_curvatures -= cell_curvatures.mean(axis=0)
+            cell_curvatures /= cell_curvatures.std(axis=0)
+
+        if 'cell_densities' in feature_options:
+            # features used in https://ieeexplore.ieee.org/abstract/document/10063862
+            barycenters = mesh.cell_centers()
+            
+            # make barycenters within [0, 1]
+            barycenters[:, 0:3] -= barycenters[:, 0:3].min(axis=0)
+            barycenters[:, 0:3] /= (barycenters[:, 0:3].max(axis=0) - barycenters[:, 0:3].min(axis=0))
+
+            from scipy.spatial import distance_matrix
+            M1 = np.zeros([mesh.ncells, mesh.ncells], dtype=np.float32)
+            M2 = np.zeros([mesh.ncells, mesh.ncells], dtype=np.float32)
+            M3 = np.zeros([mesh.ncells, mesh.ncells], dtype=np.float32)
+            D = distance_matrix(barycenters, barycenters) # distance matrix
+            M1[D<0.05] = 1
+            M2[D<0.1] = 1
+            M3[D<0.2] = 1
+            m1 = np.sum(M1, axis=1)
+            m2 = np.sum(M2, axis=1)
+            m3 = np.sum(M3, axis=1)
+            cell_densities = np.concatenate([m1.reshape(-1, 1), m2.reshape(-1, 1), m3.reshape(-1, 1)], axis=1)
+            cell_densities -= cell_densities.min(axis=0)
+            cell_densities /= (cell_densities.max(axis=0) - cell_densities.min(axis=0))
+
+    # 'points' or 'cells' is the mandatory feature
+    if 'points' in feature_options:
+        X = points
+        for i_feature in feature_options:
+            if i_feature == 'points':
+                continue
+            elif i_feature == 'point_normals':
+                X = np.column_stack((X, point_normals))
+                mesh.pointdata['Normalized_Normals'] = point_normals
+            elif i_feature == 'point_curvatures':
+                X = np.column_stack((X, point_curvatures))
+                mesh.pointdata['Normalized_Curvatures'] = point_curvatures
+            elif i_feature == 'point_densities':
+                X = np.column_stack((X, point_densities))
+                mesh.pointdata['Normalized_Densities'] = point_densities
+
+    elif 'cells' in feature_options:
+        X = cells
+        for i_feature in feature_options:
+            if i_feature == 'cells':
+                continue
+            elif i_feature == 'barycenters':
+                X = np.column_stack((X, barycenters))
+                mesh.celldata['Normalized_Barycenters'] = barycenters
+            elif i_feature == 'cell_normals':
+                X = np.column_stack((X, cell_normals))
+                mesh.celldata['Normalized_Normals'] = cell_normals
+            elif i_feature == 'cell_curvatures':
+                X = np.column_stack((X, cell_curvatures))
+                mesh.celldata['Normalized_Curvatures'] = cell_curvatures
+            elif i_feature == 'cell_densities':
+                X = np.column_stack((X, cell_densities))
+                mesh.celldata['Normalized_Densities'] = cell_densities
 
     return X, mesh
     
@@ -268,9 +325,17 @@ if __name__ == '__main__':
     # upper_mesh = vedo.load('Example_03.vtp')
 
     # meshsegnet example
+    # cell-based
     X, mesh_d = meshsegnet_feature_process(upper_mesh_d, check_manifold=True, need_decimate=True, target_ncells=10000, feature_options=['cells', 'cell_curvatures', 'cell_normals', 'cell_densities', 'barycenters'])
-    print(X.shape)
-    mesh_d.write(('tmp_Example_01_d.vtp'))
+    print(X.shape, mesh_d.ncells)
+    mesh_d.write(('tmp_Example_01_d_cell_based.vtp'))
+    # point-based
+    upper_mesh_d = upper_mesh.decimate(n=10000)
+    print('# of cells and points after decimating', upper_mesh_d.ncells, upper_mesh_d.npoints)
+    X, mesh_d = meshsegnet_feature_process(upper_mesh_d, check_manifold=True, need_decimate=False, target_ncells=10000, feature_options=['points', 'point_normals', 'point_curvatures', 'point_densities'])
+    print(X.shape, mesh_d.npoints)
+    mesh_d.write(('tmp_Example_02_d_point_based.vtp'))
+
     # X, mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, target_ncells=10000, feature_options=['cells', 'cell_normals'])
     # print(X.shape)
     # X, mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, target_ncells=10000, feature_options=['cells'])
