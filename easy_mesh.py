@@ -18,7 +18,8 @@ def meshsegnet_feature_process(target_mesh, check_manifold=False, need_decimate=
         decimate_basis: 'cell' or 'point'; decimate based on cells or points
         target_numbers: int; target number of cells or points after decimation
         feature_options: ['cells', 'barycenters', 'cell_normals'] for MeshSegNet; either 'points' or 'cells' musts be the first option
-                         current options: 'points' (NPx3), 'cells' (NCx9), 'barycenters' (NCx3), 'cell_normals' (NCx3), 'cell_curvatures' (NCx1), 'cell_densities (NCx3)'
+                         current options: 'points' (NPx3), 'point_normals' (NPx3), 'point_curvatures' (NPx1), 'point_densities' (NPx3),
+                                          'cells' (NCx9), 'barycenters' (NCx3), 'cell_normals' (NCx3), 'cell_curvatures' (NCx1), 'cell_densities (NCx3)'
     output: a numpy array for the input features of segmentation model (e.g., MeshSegNet) in either training or inference phases based on the feature_scheme
     '''
     # move mesh to origin
@@ -256,7 +257,7 @@ def mesh_grah_cut_optimization(target_mesh, label_probability, lambda_c=30, labe
     refine_labels = refine_labels.reshape([-1, 1])
 
     new_mesh = target_mesh.clone()
-    new_mesh.celldata['Label'] = refine_labels
+    new_mesh.celldata[label_name] = refine_labels
     end_time = time.time()
     total_time = end_time - start_time
     print("---Label has been refined: {} seconds ---".format(total_time))
@@ -280,8 +281,6 @@ def point_grah_cut_optimization(target_mesh, label_probability, lambda_c=3, labe
     start_time = time.time()
 
     label_probability = label_probability.squeeze()
-    print(label_probability)
-    print(label_probability.shape)
     num_classes = label_probability.shape[1]
 
     round_factor = 100
@@ -330,7 +329,7 @@ def point_grah_cut_optimization(target_mesh, label_probability, lambda_c=3, labe
     refine_labels = refine_labels.reshape([-1, 1])
 
     new_mesh = target_mesh.clone()
-    new_mesh.pointdata['Label'] = refine_labels
+    new_mesh.pointdata[label_name] = refine_labels
     end_time = time.time()
     total_time = end_time - start_time
     print("---Label has been refined: {} seconds ---".format(total_time))
@@ -338,14 +337,19 @@ def point_grah_cut_optimization(target_mesh, label_probability, lambda_c=3, labe
     return new_mesh
 
 
-def expand_selection(main_mesh, partial_mesh, n_loop=1):
+def expand_selection(original_mesh, original_partial_mesh, n_loop=1):
     '''
-    input:
-        main_mesh: a vedo mesh object
+    inputs:
+        original_mesh: a vedo mesh object
         partial_mesh: a vedo mesh object
         n_loop: number of loops to expand the selection; each loop will expand the selection by one connection
-    output: a list of selected vertex indices
+    outputs:
+        main_mesh: a vedo mesh containing a cell array "expanded_selection"
+        expanded_partial_mesh: a vedo mesh isolated by the expanded selection
     '''
+    main_mesh = original_mesh.clone()
+    partial_mesh = original_partial_mesh.clone()
+
     for i_loop in range(n_loop):
         start_time = time.time()
 
@@ -354,54 +358,59 @@ def expand_selection(main_mesh, partial_mesh, n_loop=1):
         main_cell_centers = main_mesh.cell_centers()
         main_cell_centers = vedo.Points(main_cell_centers)
 
-        original_cell_ids_of_partial_mesh = []
+        main_cell_ids_in_partial_mesh = []
         for i in range(len(partial_cell_centers)):
-            i_original_selected_cell_ids = main_cell_centers.closest_point(partial_cell_centers[i], n=1, return_point_id=True)
-            original_cell_ids_of_partial_mesh.append(i_original_selected_cell_ids)
-        original_cell_ids_of_partial_mesh = np.array(original_cell_ids_of_partial_mesh, dtype=np.int32).squeeze()
+            i_main_selected_cell_ids = main_cell_centers.closest_point(partial_cell_centers[i], n=1, return_point_id=True)
+            main_cell_ids_in_partial_mesh.append(i_main_selected_cell_ids)
+        main_cell_ids_in_partial_mesh = np.array(main_cell_ids_in_partial_mesh, dtype=np.int32).squeeze()
 
         # find the boundary points of partial mesh and their ids on original mesh
         boundary_pt_ids = partial_mesh.boundaries(return_point_ids=True)
         boundary_pts = partial_mesh.points()[boundary_pt_ids]
 
-        original_selected_boudnary_pt_ids = []
+        main_selected_boudnary_pt_ids = []
         for i in range(len(boundary_pts)):
-            i_original_selected_boudnary_pt_ids = main_mesh.closest_point(boundary_pts[i], n=1, return_point_id=True)
-            original_selected_boudnary_pt_ids.append(i_original_selected_boudnary_pt_ids)
-        original_selected_boudnary_pt_ids = np.array(original_selected_boudnary_pt_ids, dtype=np.int32).squeeze()
+            i_main_selected_boudnary_pt_ids = main_mesh.closest_point(boundary_pts[i], n=1, return_point_id=True)
+            main_selected_boudnary_pt_ids.append(i_main_selected_boudnary_pt_ids)
+        main_selected_boudnary_pt_ids = np.array(main_selected_boudnary_pt_ids, dtype=np.int32).squeeze()
 
         # create a tmp cell array ['selection'] to store the selection
-        main_mesh.celldata['tmp_selection'] = np.zeros(main_mesh.ncells)
-        main_mesh.celldata['tmp_selection'][original_cell_ids_of_partial_mesh] = 10
-        main_mesh.celldata.select('tmp_selection')
+        main_mesh.celldata['expanded_selection'] = np.zeros(main_mesh.ncells)
+        main_mesh.celldata['expanded_selection'][main_cell_ids_in_partial_mesh] = 10
+        main_mesh.celldata.select('expanded_selection')
 
         # expand selection
         expand_selection = []
-        for i in range(len(original_selected_boudnary_pt_ids)):
+        for i in range(len(main_selected_boudnary_pt_ids)):
             # i_original_selected_boudnary_pt_ids = mesh.closest_point(boundary_pts[i], n=1, return_cell_id=True)
-            connected_cells = main_mesh.connected_cells(original_selected_boudnary_pt_ids[i], return_ids=True)
+            connected_cells = main_mesh.connected_cells(main_selected_boudnary_pt_ids[i], return_ids=True)
             for j in connected_cells:
                 expand_selection.append(j)
         expand_selection = np.array(expand_selection, dtype=np.int32).squeeze()
+        expand_selection = np.unique(expand_selection)
 
-        main_mesh.celldata['tmp_selection'][expand_selection] = 10
+        main_mesh.celldata['expanded_selection'][expand_selection] = 10
 
-        partial_mesh = main_mesh.clone().threshold('tmp_selection', above=9.5, below=10.5, on='cells')
+        partial_mesh = main_mesh.clone().threshold('expanded_selection', above=9.5, below=10.5, on='cells')
+
+        # find the cell ids of partial_mesh on the main mesh
+        partial_cell_centers = partial_mesh.cell_centers()
+        main_cell_ids_in_partial_mesh = []
+        for i in range(len(partial_cell_centers)):
+            i_main_selected_cell_ids = main_cell_centers.closest_point(partial_cell_centers[i], n=1, return_point_id=True)
+            main_cell_ids_in_partial_mesh.append(i_main_selected_cell_ids)
+        main_cell_ids_in_partial_mesh = np.array(main_cell_ids_in_partial_mesh, dtype=np.int32).squeeze()
 
         end_time = time.time()
         total_time = end_time - start_time
         print("---Loop {}: {} seconds ---".format(i_loop, total_time))
 
-    # vedo_bd_pts = vedo.Points(boundary_pts)
-    # vedo.show(main_mesh, vedo_bd_pts)
-    main_mesh.celldata.remove('tmp_selection')
-
-    return partial_mesh
+    return main_mesh, partial_mesh, main_cell_ids_in_partial_mesh
 
 
 if __name__ == '__main__':
 
-    upper_mesh = vedo.load('Example_01.vtp')
+    #upper_mesh = vedo.load('Example_01.vtp')
     # upper_mesh_d = vedo.load('Example_02_d.vtp')
     # upper_mesh = vedo.load('Example_03.vtp')
     # upper_mesh = vedo.load('00OMSZGW_upper_point.vtp')
@@ -409,13 +418,14 @@ if __name__ == '__main__':
     #------------------------------------------------------------------------------------
     # meshsegnet example
     # cell-based
-    mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, decimate_basis='cell', target_numbers=10000, feature_options=['cells', 'cell_curvatures', 'cell_normals', 'cell_densities', 'barycenters'])
+    mesh = vedo.load('outputs\883191607_20220311_2137_PMMA_A22031081_X_lower.vtp')
+    mesh_d = meshsegnet_feature_process(mesh, check_manifold=True, need_decimate=True, decimate_basis='cell', target_numbers=10000, feature_options=['cells', 'cell_curvatures', 'cell_normals', 'cell_densities', 'barycenters'])
     print(mesh_d.pointdata.keys(), mesh_d.celldata.keys())
-    mesh_d.write(('tmp_Example_01_d_cell_based.vtp'))
+    mesh_d.write(('tmp_cell_based.vtp'))
     # point-based
-    mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, decimate_basis='point', target_numbers=10000, feature_options=['points', 'point_normals', 'point_curvatures', 'point_densities'])
-    print(mesh_d.pointdata.keys(), mesh_d.celldata.keys())
-    mesh_d.write(('tmp_Example_02_d_point_based.vtp'))
+    # mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, decimate_basis='point', target_numbers=10000, feature_options=['points', 'point_normals', 'point_curvatures', 'point_densities'])
+    # print(mesh_d.pointdata.keys(), mesh_d.celldata.keys())
+    # mesh_d.write(('tmp_Example_02_d_point_based.vtp'))
 
     # X, mesh_d = meshsegnet_feature_process(upper_mesh, check_manifold=True, need_decimate=True, target_ncells=10000, feature_options=['cells', 'cell_normals'])
     # print(X.shape)
@@ -426,10 +436,11 @@ if __name__ == '__main__':
     # graph-cut example
     # cell-based
     # label_probability = np.zeros([upper_mesh_d.ncells, 17])
-    # # init probability; 0.9 for each cell with the current label
+    # init probability; 0.9 for each cell with the current label
     # for i_label in range(17):
     #     label_probability[upper_mesh_d.celldata['Label']==i_label, i_label] = 0.9
     # refined_label_mesh = mesh_grah_cut_optimization(upper_mesh_d, label_probability, lambda_c = 30, label_name='Label')
+    # refined_label_mesh.write('Example_02_d_cell_refined.vtp')
     # upper_mesh_d.show().close()
     # refined_label_mesh.show().close()
 
@@ -447,35 +458,8 @@ if __name__ == '__main__':
     
     #------------------------------------------------------------------------------------
     # expand_selection example
-    # teeth_mesh = upper_mesh.clone().threshold('Label', above=0.5, below=16.5, on='cells').c('red')
-    # expanded_teeth_mesh = expand_selection(upper_mesh, teeth_mesh, n_loop=5).c('blue').alpha(0.5)
-    # vedo.show(teeth_mesh, expanded_teeth_mesh).close()
-
-    # density feature
-    # cell_centers = mesh_d.cell_centers()
-    # cell_centers[:, 0:3] -= cell_centers[:, 0:3].min(axis=0)
-    # cell_centers[:, 0:3] /= (cell_centers[:, 0:3].max(axis=0) - cell_centers[:, 0:3].min(axis=0))
-    # from scipy.spatial import distance_matrix
-    # M1 = np.zeros([mesh_d.ncells, mesh_d.ncells])
-    # M2 = np.zeros([mesh_d.ncells, mesh_d.ncells])
-    # M3 = np.zeros([mesh_d.ncells, mesh_d.ncells])
-    # D = distance_matrix(cell_centers, cell_centers)
-    # # print(D)
-    # M1[D<0.05] = 1
-    # M2[D<0.1] = 1
-    # M3[D<0.2] = 1
-    # m1 = np.sum(M1, axis=1)
-    # m2 = np.sum(M2, axis=1)
-    # m3 = np.sum(M3, axis=1)
-    # m = np.concatenate([m1.reshape(-1, 1), m2.reshape(-1, 1), m3.reshape(-1, 1)], axis=1)
-    # print(m)
-    # m -= m.min(axis=0)
-    # m /= (m.max(axis=0) - m.min(axis=0))
-    # print(m)
-    # print(m.shape)
-    # mesh_d.celldata['Density'] = m
-    # mesh_d.celldata['Density_mag'] = np.linalg.norm(m, axis=1)
-    # mesh_d.write(('tmp_Example_03_d.vtp'))
-
-
-    
+    # teeth_mesh = upper_mesh_d.clone().threshold('Label', above=0.5, below=16.5, on='cells').c('red')
+    # upper_mesh_d, expanded_teeth_mesh, partial_main_cell_ids = expand_selection(upper_mesh_d, teeth_mesh, n_loop=3)
+    # print(expanded_teeth_mesh.ncells, partial_main_cell_ids.shape)
+    #upper_mesh_d.write('test_selection.vtp')
+    #expanded_teeth_mesh.write('isolated_test_selection.vtp')
